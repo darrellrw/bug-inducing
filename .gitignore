@@ -1,0 +1,6 @@
+# Directories to ignore
+datasets/
+repository/
+
+# Files to ignore
+catatan.txt
