@@ -5,6 +5,7 @@ import networkx as nx
 import matplotlib.pyplot as plt
 
 from git import Repo
+from pydriller import Repository
 from matplotlib.lines import Line2D
 
 import hashlib
@@ -180,30 +181,51 @@ class Builder:
         self.repo = Repo(self.repo_path)
         self.commit = self.repo.commit(commit_hash)
 
+        self.sources = None
         self.graphs = {}
         self.failed_files = {}
 
+    @classmethod
+    def from_sources(cls, commit_hash, sources):
+        """Builder tanpa Repo lokal. sources: {path: source_code} (mis. dari load_commit)."""
+        self = cls.__new__(cls)
+        self.folder_path = self.project_name = self.repo_path = None
+        self.repo = self.commit = None
+        self.commit_hash = commit_hash
+        self.sources = sources
+        self.graphs = {}
+        self.failed_files = {}
+        return self
+
     def build(self, paths=None):
         """paths: kalau diisi, hanya file dengan path itu yang diparse."""
+        if self.sources is not None:
+            for path, source_code in self.sources.items():
+                if paths is None or path in paths:
+                    self._build_one(path, lambda s=source_code: s)
+            return self.graphs
+
         for item in self.commit.tree.traverse():
             if item.type != "blob" or not item.path.endswith(".py"):
                 continue
             if paths is not None and item.path not in paths:
                 continue
-
-            print(f"Processing file: {item.path}")
-
-            try:
-                source_code = item.data_stream.read().decode("utf-8")
-                tree = ast.parse(source_code)
-            except (SyntaxError, UnicodeDecodeError, ValueError) as e:
-                print(f"  Skip {item.path}: {type(e).__name__}: {e}")
-                self.failed_files[item.path] = str(e)
-                continue
-
-            self.graphs[item.path] = self.build_graph(tree, item.path)
+            self._build_one(item.path, lambda i=item: i.data_stream.read().decode("utf-8"))
 
         return self.graphs
+
+    def _build_one(self, path, read_source):
+        print(f"Processing file: {path}")
+
+        try:
+            source_code = read_source()
+            tree = ast.parse(source_code)
+        except (SyntaxError, UnicodeDecodeError, ValueError) as e:
+            print(f"  Skip {path}: {type(e).__name__}: {e}")
+            self.failed_files[path] = str(e)
+            return
+
+        self.graphs[path] = self.build_graph(tree, path)
 
     def build_graph(self, tree, path):
         graph = Graph(path)
@@ -596,13 +618,15 @@ def mark_one_sided(g, status, uid_prefix):
         g.G, {n: f"{uid_prefix}u{i}" for i, n in enumerate(g.G.nodes)}, "uid")
 
 
-def unify_commit(builder_before, builder_current, files=None):
+def unify_commit(builder_before, builder_current, files=None, pairs=None):
     """
     Bandingkan dua commit pada level file. Hanya file .py yang berubah yang diparse.
     files: opsional, batasi ke path tertentu (mis. kolom file_path dataset).
+    pairs: opsional, [(path_before | None, path_current | None)]; default dari git diff.
     Return: (list[FileDiff], skipped: {path: alasan})
     """
-    pairs = changed_py_files(builder_before.commit, builder_current.commit)
+    if pairs is None:
+        pairs = changed_py_files(builder_before.commit, builder_current.commit)
     if files is not None:
         keep = set(files)
         pairs = [(a, b) for a, b in pairs if a in keep or b in keep]
@@ -632,6 +656,51 @@ def unify_commit(builder_before, builder_current, files=None):
             mark_one_sided(gb, "removed", pre)
             results.append(FileDiff(a, None, "removed", gb, None))
     return results, skipped
+
+
+# ---------------------------------------------------------------------------
+# PyDriller: ambil data commit langsung dari URL (clone otomatis ke cache_dir)
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CommitData:
+    hash: str
+    parent_hash: Optional[str]
+    msg: str
+    files: list   # [(path_before | None, path_current | None, source_before, source_current)]
+
+
+def load_commit(repo_url, commit_hash, cache_dir="repository"):
+    """Commit + file .py yang berubah via PyDriller. Repo di-clone sekali ke cache_dir
+    lalu dipakai ulang di run berikutnya."""
+    os.makedirs(cache_dir, exist_ok=True)
+    commit = next(Repository(repo_url, single=commit_hash, clone_repo_to=cache_dir).traverse_commits())
+
+    files = []
+    for m in commit.modified_files:
+        # PyDriller memakai separator OS (\ di Windows); samakan dengan path git (/)
+        a = m.old_path.replace(os.sep, "/") if m.old_path else None
+        b = m.new_path.replace(os.sep, "/") if m.new_path else None
+        a = a if a and a.endswith(".py") else None   # bukan .py -> anggap tidak ada
+        b = b if b and b.endswith(".py") else None
+        if a or b:
+            files.append((a, b, m.source_code_before if a else None, m.source_code if b else None))
+
+    parent = commit.parents[0] if commit.parents else None
+    if parent and not files and commit.merge:
+        print(f"Warning: {commit.hash} adalah merge commit; PyDriller tidak memberi daftar file yang berubah.")
+    return CommitData(commit.hash, parent, commit.msg, files)
+
+
+def unify_commit_from_url(repo_url, commit_hash, files=None, cache_dir="repository"):
+    """Seperti unify_commit, tapi cukup URL + hash.
+    Return: (builder_before, builder_current, list[FileDiff], skipped)"""
+    data = load_commit(repo_url, commit_hash, cache_dir)
+    builder_before = Builder.from_sources(data.parent_hash, {a: sb for a, _, sb, _ in data.files if a})
+    builder_current = Builder.from_sources(data.hash, {b: sc for _, b, _, sc in data.files if b})
+    pairs = [(a, b) for a, b, _, _ in data.files]
+    file_diffs, skipped = unify_commit(builder_before, builder_current, files=files, pairs=pairs)
+    return builder_before, builder_current, file_diffs, skipped
 
 
 

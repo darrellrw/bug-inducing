@@ -1,0 +1,6 @@
+networkx
+matplotlib
+scipy
+GitPython
+pydriller
+ipykernel
