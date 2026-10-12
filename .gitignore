@@ -1,8 +1,9 @@
 # Directories to ignore
 datasets/
-repository/
+repositories/
 .venv/
 __pycache__/
+other/
 
 # Files to ignore
 catatan.txt
